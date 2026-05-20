@@ -331,7 +331,7 @@ async function finishGame(io, roomId) {
 const httpServer = createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
-    status: "ok", version: "6.0",
+    status: "ok", version: "6.1",
     rooms: Object.keys(rooms).length,
     queues: Object.fromEntries(Object.entries(queues).map(([k, v]) => [k, v.length])),
     groq: GROQ_KEY ? "connected" : "missing",
