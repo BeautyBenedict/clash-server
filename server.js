@@ -463,7 +463,7 @@ function leaveEverything(socket, wallet, io) {
   delete playerRoom[wallet];
 }
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Clash Arena server v6 → port ${PORT}`);
   console.log(`   Game types : ${Object.keys(GAME_TYPES).join(", ")}`);
   console.log(`   Room sizes : ${ROOM_SIZES.join(", ")} players`);
