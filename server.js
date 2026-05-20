@@ -1,23 +1,20 @@
 // ============================================================
-// server.js — Clash Arena Backend v6
+// server.js — Clash Arena Backend v6 (Persistent & Sync-Enabled)
 // © Beauty Benedict. All rights reserved.
 //
-// FIXES:
-//  1. agentStore keyed by agent.id — merges from all devices,
-//     never overwrites. Same wallet on PC + phone = union of agents.
-//  2. broadcastQueueCounts() uses io.emit() (ALL sockets).
-//     Every open browser sees live counts the moment anyone joins.
-//  3. Queue counts pushed immediately on new connection.
-//  4. Multiple simultaneous rooms per game type — 100 players
-//     in "rps-2" automatically fills as many 1v1 rooms as needed.
-//     No waiting for a previous game to finish.
+// Deployed on Railway.
+// Handles queue matchmaking, Groq AI gameplay simulation,
+// and real-time cross-device agent synchronization.
 // ============================================================
 
 const { createServer } = require("http");
 const { Server }       = require("socket.io");
+const fs               = require("fs");
+const path             = require("path");
 
-const PORT     = process.env.PORT     || 3001;
+const PORT     = process.env.PORT || 3001;
 const GROQ_KEY = process.env.GROQ_API_KEY;
+const AGENTS_FILE = path.join(__dirname, "agents.json");
 
 if (!GROQ_KEY) console.warn("⚠️  GROQ_API_KEY not set — agents will use fallback logic");
 
@@ -38,16 +35,32 @@ const queues     = {};  // "rps-2": [player, ...]
 const rooms      = {};  // roomId -> Room
 const playerRoom = {};  // walletAddress -> roomId
 
-// Agent store: wallet -> { agentId -> agent }
-// Object map so merging from multiple devices is safe (no overwrite).
-const agentStore = {};
+// Persistent Agent store: wallet -> { agentId -> agent }
+let agentStore = {};
+
+// Load persisted agents database
+try {
+  if (fs.existsSync(AGENTS_FILE)) {
+    agentStore = JSON.parse(fs.readFileSync(AGENTS_FILE, "utf8"));
+    console.log(`[Database] Loaded agents for ${Object.keys(agentStore).length} wallets.`);
+  }
+} catch (err) {
+  console.error("[Database] Error loading agents database:", err);
+}
+
+function saveAgentsToFile() {
+  try {
+    fs.writeFileSync(AGENTS_FILE, JSON.stringify(agentStore, null, 2), "utf8");
+  } catch (err) {
+    console.error("[Database] Error saving agents database:", err);
+  }
+}
 
 let roomCounter = 0;
 const makeRoomId  = () => `room-${++roomCounter}-${Date.now().toString(36)}`;
 const qKey        = (gt, sz) => `${gt}-${sz}`;
 
 // ── Broadcast queue counts to EVERY connected socket ──────
-// This is what makes the waiting room show live counts on all devices.
 function broadcastQueueCounts(io) {
   const counts = {};
   ROOM_SIZES.forEach(sz => {
@@ -55,7 +68,7 @@ function broadcastQueueCounts(io) {
       counts[qKey(gt, sz)] = queues[qKey(gt, sz)]?.length ?? 0;
     });
   });
-  io.emit("queue_counts", counts); // io.emit = ALL sockets, no room filter
+  io.emit("queue_counts", counts);
 }
 
 // ── Agent helpers ─────────────────────────────────────────
@@ -108,7 +121,29 @@ function fallback(agent, gameType) {
   else if (d.includes("chaos") || d.includes("random") || d.includes("unpred"))  move = RPS_MOVES[Math.floor(Math.random() * 3)];
   else if (d.includes("smart") || d.includes("analyt") || d.includes("logic"))   move = s < 0.4 ? "paper" : s < 0.7 ? "scissors" : "rock";
   else move = RPS_MOVES[Math.floor(s * 3)];
-  return { move, reasoning: "" };
+
+  const reasonings = {
+    rock: [
+      "Crushing standard tactics with a solid Rock strategy.",
+      "Brute force will break their defenses. Rock is my choice.",
+      "Solid as a mountain. I choose Rock to shatter their blades."
+    ],
+    paper: [
+      "Enveloping the opponent's aggressive energy with calm Paper.",
+      "A calculated shield. Paper covers all possibilities.",
+      "Tactical wrap-around strategy. Choosing Paper for control."
+    ],
+    scissors: [
+      "A quick, decisive Scissors cut to slice their plans.",
+      "Precision strike. Scissors will snip their paper defense.",
+      "Swift and sharp. I choose Scissors to cut down the opposition."
+    ]
+  };
+
+  const pool = reasonings[move] || ["Calculated strategic alignment."];
+  const reasoning = pool[Math.floor(Math.random() * pool.length)];
+
+  return { move, reasoning };
 }
 
 function resolveRPS(a, b) {
@@ -135,17 +170,29 @@ function createRoom(gameType, size, players) {
 }
 
 // ── Matchmaking — creates as many rooms as the queue allows ──
-// If 100 players join rps-2, this fires 50 rooms simultaneously.
 function tryMatch(io, gameType, size) {
   const key = qKey(gameType, size);
   if (!queues[key]) return;
+
+  // Filter out any disconnected sockets from the queue
+  const activeQueue = [];
+  queues[key].forEach(p => {
+    if (io.sockets.sockets.has(p.socketId)) {
+      activeQueue.push(p);
+    }
+  });
+  queues[key] = activeQueue;
+
   while (queues[key].length >= size) {
     const matched = queues[key].splice(0, size);
     const room    = createRoom(gameType, size, matched);
     console.log(`[match] ${gameType}x${size} → ${room.roomId} | ${matched.map(p => p.agentName).join(", ")}`);
     matched.forEach(p => {
       const sock = io.sockets.sockets.get(p.socketId);
-      if (sock) sock.join(room.roomId);
+      if (sock) {
+        sock.join(room.roomId);
+        sock.leave(key); // Leave queue room
+      }
     });
     io.to(room.roomId).emit("matched", { roomId: room.roomId, room, message: `${matched.length} agents matched! Battle begins in 2 seconds…` });
     broadcastQueueCounts(io); // update counts after splicing
@@ -254,6 +301,7 @@ async function finishGame(io, roomId) {
     else                      agent.draws  = (agent.draws  || 0) + 1;
     agentStore[wallet][agent.id] = agent;
   });
+  saveAgentsToFile();
 
   let victorySummary = "";
   try {
@@ -294,18 +342,19 @@ const httpServer = createServer((req, res) => {
 const io = new Server(httpServer, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
 io.on("connection", (socket) => {
-  console.log(`[+] ${socket.id}`);
-  broadcastQueueCounts(io); // give this socket current counts immediately
+  console.log(`[+] Client connected: ${socket.id}`);
+  broadcastQueueCounts(io);
 
   // ── AGENT SYNC ────────────────────────────────────────
-  // Client sends its full localStorage agent list on wallet connect.
-  // Server merges by agent.id — never overwrites, always union.
-  // Replies with the merged authoritative list for this wallet.
   socket.on("sync_agents", ({ walletAddress, agents }) => {
     const wallet = walletAddress?.toLowerCase();
     if (!wallet) return;
+
+    socket.join(`wallet:${wallet}`);
     mergeAgents(wallet, agents);
-    socket.emit("agents_synced", { walletAddress: wallet, agents: agentList(wallet) });
+    saveAgentsToFile();
+
+    io.to(`wallet:${wallet}`).emit("agents_synced", { walletAddress: wallet, agents: agentList(wallet) });
     console.log(`[agents] synced ${agentList(wallet).length} for ${wallet}`);
   });
 
@@ -314,7 +363,9 @@ io.on("connection", (socket) => {
     if (!wallet || !agent?.id) return;
     if (!agentStore[wallet]) agentStore[wallet] = {};
     agentStore[wallet][agent.id] = agent;
-    socket.emit("agents_synced", { walletAddress: wallet, agents: agentList(wallet) });
+    saveAgentsToFile();
+
+    io.to(`wallet:${wallet}`).emit("agents_synced", { walletAddress: wallet, agents: agentList(wallet) });
     console.log(`[agents] added "${agent.name}" for ${wallet}`);
   });
 
@@ -322,7 +373,10 @@ io.on("connection", (socket) => {
     const wallet = walletAddress?.toLowerCase();
     if (!wallet || !agentId) return;
     if (agentStore[wallet]) delete agentStore[wallet][agentId];
-    socket.emit("agents_synced", { walletAddress: wallet, agents: agentList(wallet) });
+    saveAgentsToFile();
+
+    io.to(`wallet:${wallet}`).emit("agents_synced", { walletAddress: wallet, agents: agentList(wallet) });
+    console.log(`[agents] deleted ${agentId} for ${wallet}`);
   });
 
   // ── JOIN QUEUE ────────────────────────────────────────
@@ -333,10 +387,19 @@ io.on("connection", (socket) => {
 
     const key = qKey(gameType, size);
     if (!queues[key]) queues[key] = [];
-    if (queues[key].find(p => p.walletAddress === wallet)) return; // already queued
+    
+    // Check if wallet is already queued
+    const already = queues[key].find(p => p.walletAddress === wallet);
+    if (!already) {
+      const player = { walletAddress: wallet, agentName, agentDescription, socketId: socket.id, score: 0, roundWins: 0, roundHistory: [] };
+      queues[key].push(player);
+      console.log(`[queue] ${agentName} joined queue ${key} (${queues[key].length}/${size})`);
+    } else {
+      already.socketId = socket.id;
+      already.agentName = agentName;
+      already.agentDescription = agentDescription;
+    }
 
-    const player = { walletAddress: wallet, agentName, agentDescription, socketId: socket.id, score: 0, roundWins: 0, roundHistory: [] };
-    queues[key].push(player);
     socket.data.queueKey = key;
     socket.data.wallet   = wallet;
     socket.join(key);
@@ -347,8 +410,13 @@ io.on("connection", (socket) => {
       message: `${waiting} / ${size} in queue${waiting === 1 ? " — waiting for opponents…" : "…"}`,
     });
 
-    broadcastQueueCounts(io); // tell EVERY socket the new count
-    console.log(`[queue] ${agentName} → ${key} (${waiting}/${size})`);
+    // Notify other players in this specific queue room
+    socket.to(key).emit("queue_update", {
+      gameType, size, waiting,
+      message: `${waiting} / ${size} in queue — waiting for opponents…`,
+    });
+
+    broadcastQueueCounts(io);
     tryMatch(io, gameType, size);
   });
 
@@ -370,8 +438,11 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    if (socket.data?.wallet) { leaveEverything(socket, socket.data.wallet, io); broadcastQueueCounts(io); }
-    console.log(`[-] ${socket.id}`);
+    if (socket.data?.wallet) { 
+      leaveEverything(socket, socket.data.wallet, io); 
+      broadcastQueueCounts(io); 
+    }
+    console.log(`[-] Client disconnected: ${socket.id}`);
   });
 });
 
@@ -384,7 +455,11 @@ function leaveEverything(socket, wallet, io) {
       io.to(key).emit("queue_update", { waiting: queues[key].length, size: parseInt(key.split("-").pop()) });
     }
   });
-  socket.rooms.forEach(r => { if (r !== socket.id) socket.leave(r); });
+  
+  socket.rooms.forEach(r => { 
+    if (r !== socket.id) socket.leave(r); 
+  });
+  
   delete playerRoom[wallet];
 }
 
